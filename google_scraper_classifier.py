@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 from googlesearch import search
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import torch
-torch.classes.__path__ = []  # <== WORKAROUND PER BUG #8488
 import torch.nn.functional as F
 from deep_translator import GoogleTranslator
 from urllib.parse import urlparse
@@ -413,7 +412,7 @@ if go_button:
             query = f"{country} {topic} policy {date_filter}"
             st.write(f"**🔎 Query:** {query}")
             try:
-                time.sleep(random.uniform(10, 20))
+                time.sleep(random.uniform(5, 10))
                 urls = search(query, num_results=5, lang=search_lang, safe="off")
             except Exception as e:
                 st.warning(f"⚠️ Google search error: {e}")

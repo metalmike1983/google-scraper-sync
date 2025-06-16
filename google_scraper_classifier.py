@@ -316,8 +316,22 @@ def classify_text(text):
 
 def clean_illegal_chars(text):
     return re.sub(r"[\x00-\x1F\x7F-\x9F]", "", text)
+def save_and_continue(country, batch_number, results):
+    df = pd.DataFrame(results)
+    output = io.BytesIO()
+    df.to_excel(output, index=False, engine="openpyxl")
+    filename = f"results_{country}_batch{batch_number}.xlsx"
+    with open(filename, "wb") as f:
+        f.write(output.getvalue())
+    st.write(f"✅ Batch {batch_number} salvato come {filename}")
+    st.session_state.results.extend(results)
+    st.session_state.batch_memory["topic_index"] += 5
+    if st.session_state.batch_memory["topic_index"] >= len(st.session_state.topics):
+        st.session_state.batch_memory["country_index"] += 1
+        st.session_state.batch_memory["topic_index"] = 0
+    st.rerun()
 
-st.title("🌍 Policy Scraper — Auto batch by country (5 topics each)")
+st.title("🌍 Policy Scraper — Auto batch (5 topics per country)")
 
 if "batch_memory" not in st.session_state:
     st.session_state.batch_memory = {"country_index": 0, "topic_index": 0}
@@ -325,77 +339,66 @@ if "results" not in st.session_state:
     st.session_state.results = []
 
 countries_input = st.text_input("Countries (comma separated):", "France, Italy")
-topics_input = st.multiselect("Topics:", options=FAPDA_TOPICS,    default=[])
+topics_input = st.multiselect("Topics:", options=["Food subsidy", "Unconditional cash transfer", "Tax on fuel and water", "Price control", "Import tariff", "Export ban", "Nutrition and health policy", "Production subsidies"], default=[])
 start_date = st.text_input("Start Date (YYYY-MM-DD):", "")
 end_date = st.text_input("End Date (YYYY-MM-DD):", "")
 search_owner = st.text_input("User:", "user")
 
-countries = [c.strip() for c in countries_input.split(",") if c.strip()]
-topics = topics_input or ["Food subsidy", "Unconditional cash transfer", "Tax on fuel and water"]
-chunk_size = 5
+if "countries" not in st.session_state:
+    st.session_state.countries = [c.strip() for c in countries_input.split(",") if c.strip()]
+if "topics" not in st.session_state:
+    st.session_state.topics = topics_input or ["Food subsidy", "Unconditional cash transfer", "Tax on fuel and water"]
 
 ci = st.session_state.batch_memory["country_index"]
 ti = st.session_state.batch_memory["topic_index"]
 
-if ci < len(countries):
-    country = countries[ci]
-    st.header(f"🌐 Country: {country}")
-    if ti < len(topics):
-        batch_topics = topics[ti:ti + chunk_size]
-        st.subheader(f"📦 Topics {ti + 1} to {ti + len(batch_topics)}")
-        results = []
-        for topic in batch_topics:
-            query = f"{country} {topic} policy"
-            if start_date:
-                query += f" after:{start_date}"
-            if end_date:
-                query += f" before:{end_date}"
-            st.write(f"🔍 Query: {query}")
-            try:
-                urls = search(query, num_results=3, lang="en", safe="off")
-                for url in urls:
-                    if is_url_excluded(url):
-                        continue
-                    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                    if "application/pdf" in response.headers.get("Content-Type", ""):
-                        continue
-                    soup = BeautifulSoup(response.text, "html.parser")
-                    content = " ".join([p.get_text() for p in soup.find_all("p")])
-                    if len(content) < 100:
-                        continue
-                    translated = GoogleTranslator(source="auto", target="en").translate(content[:4000])
-                    translated = clean_illegal_chars(translated)
-                    label, confidence = classify_text(translated)
-                    summary = ""
-                    if confidence > 0.3:
-                        try:
-                            summary = summary_pipe(translated[:512], max_new_tokens=100, min_length=30, do_sample=False)[0]["summary_text"]
-                        except:
-                            pass
-                    results.append({
-                        "Country": country,
-                        "Topic": topic,
-                        "URL": url,
-                        "Label": label,
-                        "Confidence": round(confidence, 2),
-                        "Summary": summary
-                    })
-            except Exception as e:
-                st.warning(f"❌ Error: {e}")
+if ci < len(st.session_state.countries):
+    country = st.session_state.countries[ci]
+    topics = st.session_state.topics
+    batch_topics = topics[ti:ti + 5]
+    st.subheader(f"🌐 {country} — Topics {ti + 1} to {ti + len(batch_topics)}")
+    results = []
+    for topic in batch_topics:
+        query = f"{country} {topic} policy"
+        if start_date:
+            query += f" after:{start_date}"
+        if end_date:
+            query += f" before:{end_date}"
+        st.write(f"🔍 Query: {query}")
+        try:
+            urls = search(query, num_results=3, lang="en", safe="off")
+            for url in urls:
+                if is_url_excluded(url):
+                    continue
+                response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                if "application/pdf" in response.headers.get("Content-Type", ""):
+                    continue
+                soup = BeautifulSoup(response.text, "html.parser")
+                content = " ".join([p.get_text() for p in soup.find_all("p")])
+                if len(content) < 100:
+                    continue
+                translated = GoogleTranslator(source="auto", target="en").translate(content[:4000])
+                translated = clean_illegal_chars(translated)
+                label, confidence = classify_text(translated)
+                summary = ""
+                if confidence > 0.3:
+                    try:
+                        summary = summary_pipe(translated[:512], max_new_tokens=100, min_length=30, do_sample=False)[0]["summary_text"]
+                    except:
+                        pass
+                results.append({
+                    "Country": country,
+                    "Topic": topic,
+                    "URL": url,
+                    "Label": label,
+                    "Confidence": round(confidence, 2),
+                    "Summary": summary
+                })
+        except Exception as e:
+            st.warning(f"❌ Error: {e}")
 
-        if results:
-            df = pd.DataFrame(results)
-            st.session_state.results.extend(results)
-            st.dataframe(df)
-            output = io.BytesIO()
-            df.to_excel(output, index=False, engine="openpyxl")
-            st.download_button(f"📥 Download {country}_batch{ti//chunk_size + 1}", output.getvalue(), file_name=f"results_{country}_batch{ti//chunk_size + 1}.xlsx")
-
-        st.session_state.batch_memory["topic_index"] += chunk_size
-        if st.session_state.batch_memory["topic_index"] >= len(topics):
-            st.session_state.batch_memory["country_index"] += 1
-            st.session_state.batch_memory["topic_index"] = 0
-
-        st.stop()
+    if results:
+        batch_num = ti // 5 + 1
+        save_and_continue(country, batch_num, results)
 else:
     st.success("🎉 All countries and topic batches processed.")

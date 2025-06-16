@@ -396,6 +396,6 @@ if ci < len(countries):
             st.session_state.batch_memory["country_index"] += 1
             st.session_state.batch_memory["topic_index"] = 0
 
-        st.rerun()
+        st.stop()
 else:
     st.success("🎉 All countries and topic batches processed.")

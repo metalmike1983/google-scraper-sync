@@ -1,3 +1,5 @@
+# AGGIORNAMENTO: Scraping batch automatico con memoria di avanzamento (5 topics per paese)
+
 import os
 import re
 import io
@@ -13,25 +15,20 @@ from deep_translator import GoogleTranslator
 from urllib.parse import urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
 import streamlit as st
 import warnings
 from dateutil.parser import parse
-import fitz  # PyMuPDF for PDF processing
-import tempfile
-import subprocess
+import fitz
 import tempfile
 import subprocess
 import random
 
-
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# === CONFIG ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = "mike-83/longformer_policy_classifier"
-TEXT_SIM_THRESHOLD = 0.85
-PDF_TEXT_LIMIT = 5000  # Max number of characters to extract from PDF
+PDF_TEXT_LIMIT = 5000
+EXCLUDED_DOMAINS = ["soundcloud.com", "youtube.com", "youtu.be", "spotify.com", "vimeo.com", "facebook.com", "instagram.com"]
 
 EXCLUDED_DOMAINS = [
     "soundcloud.com", "youtube.com", "youtu.be", "spotify.com",
@@ -290,21 +287,6 @@ default_topics =    ["Unspecified tax policy",
 "Agricultural expenditure in the national budget"
 ]
 
-
-
-st.title("Google Policy Scraper — Multicountry & Custom Topics")
-countries_input = st.text_input("Countries (separate multiple countries with commas):", "France, Italy")
-
-topics_input = st.multiselect(    "Select or type topics:",    options=FAPDA_TOPICS,    default=[],    help="Start typing to filter topics.")
-selected_topics = topics_input if topics_input else [t for t in default_topics if t in FAPDA_TOPICS]
-start_date = st.text_input("Start Date (YYYY-MM-DD, optional):", "")
-end_date = st.text_input("End Date (YYYY-MM-DD, optional):", "")
-search_owner = st.text_input("User (optional):", "user")
-
-st.caption("Searches will be conducted in English (Google 'hl=en')")
-go_button = st.button("Scrape and Classify")
-search_lang = "en"
-
 @st.cache_resource
 def load_policy_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -323,29 +305,6 @@ def is_url_excluded(url):
     domain = urlparse(url).netloc.lower()
     return any(excl in domain for excl in EXCLUDED_DOMAINS)
 
-def extract_text_from_pdf(file, char_limit=PDF_TEXT_LIMIT):
-    try:
-        file.seek(0)
-        doc = fitz.open(stream=file.read(), filetype="pdf")
-        text = " ".join([page.get_text("text") for page in doc])
-        if not text.strip():
-            file.seek(0)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                tmp_pdf.write(file.read())
-                tmp_pdf_path = tmp_pdf.name
-            try:
-                result = subprocess.run(["pdftotext", tmp_pdf_path, "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                text = result.stdout.decode("utf-8")
-            except Exception as e:
-                st.warning(f"⚠️ pdftotext failed: {e}")
-        return text[:char_limit] if text else None
-    except Exception as e:
-        st.warning(f"⚠️ Error reading PDF: {e}")
-        return None
-
-def clean_illegal_chars(text):
-    return re.sub(r"[\x00-\x1F\x7F-\x9F]", "", text)
-
 def classify_text(text):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
@@ -355,175 +314,88 @@ def classify_text(text):
     confidence = max(probs)
     return label, confidence
 
-def refine_policy_decision(text):
-    framework_indicators = [
-        "framework", "reform", "strategy", "plan of action", "guideline",
-        "policy structure", "national strategy", "policy framework",
-        "regulatory framework", "institutional framework"
-    ]
-    decision_indicators = [
-        "implemented", "introduced", "approved", "enacted", "adopted",
-        "launched", "put into effect", "issued by", "effective from",
-        "subsidy provided", "tax exemption granted"
-    ]
-    text_lower = text.lower()
-    framework_score = sum(1 for kw in framework_indicators if kw in text_lower)
-    decision_score = sum(1 for kw in decision_indicators if kw in text_lower)
-    if framework_score >= 2 and framework_score > decision_score:
-        return "policy_framework"
-    return "policy_decision"
+def clean_illegal_chars(text):
+    return re.sub(r"[\x00-\x1F\x7F-\x9F]", "", text)
 
-def drop_near_duplicates(df, text_col="text", url_col="Source 1 Link", text_threshold=0.85):
-    df = df.copy()
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
-    tfidf_matrix = vectorizer.fit_transform(df[text_col])
-    to_drop = set()
-    for i in tqdm(range(len(df)), desc="🔍 Checking duplicates", unit="doc"):
-        if i in to_drop:
-            continue
-        for j in range(i + 1, len(df)):
-            if j in to_drop:
-                continue
-            sim = cosine_similarity(tfidf_matrix[i], tfidf_matrix[j])[0][0]
-            if sim > text_threshold:
-                to_drop.add(j)
-    dropped_urls = df.iloc[list(to_drop)][url_col].tolist()
-    print(f"🧹 Rimossi {len(to_drop)} duplicati approssimati.")
-    print("URLs rimossi come duplicati:", dropped_urls)
-    return df.drop(index=list(to_drop))
+st.title("🌍 Policy Scraper — Auto batch by country (5 topics each)")
 
-if go_button:
-    countries = [c.strip() for c in countries_input.split(",") if c.strip()]
-    topics = [t.strip() for t in topics_input if t.strip()] or FAPDA_TOPICS
+if "batch_memory" not in st.session_state:
+    st.session_state.batch_memory = {"country_index": 0, "topic_index": 0}
+if "results" not in st.session_state:
+    st.session_state.results = []
 
-    all_results = []
-    excluded_documents = []
-    st.info("🔍 Starting Google search and classification...")
-    main_progress = st.progress(0)
-    total_tasks = len(countries) * len(topics)
-    task_idx = 0
+countries_input = st.text_input("Countries (comma separated):", "France, Italy")
+topics_input = st.multiselect("Topics:", options=FAPDA_TOPICS,    default=[])
+start_date = st.text_input("Start Date (YYYY-MM-DD):", "")
+end_date = st.text_input("End Date (YYYY-MM-DD):", "")
+search_owner = st.text_input("User:", "user")
 
-    for country in countries:
-        for topic in topics:
-            task_idx += 1
-            main_progress.progress(task_idx / total_tasks)
-            date_filter = f" after:{start_date}" if start_date else ""
-            date_filter += f" before:{end_date}" if end_date else ""
-            query = f"{country} {topic} policy {date_filter}"
-            st.write(f"**🔎 Query:** {query}")
+countries = [c.strip() for c in countries_input.split(",") if c.strip()]
+topics = topics_input or ["Food subsidy", "Unconditional cash transfer", "Tax on fuel and water"]
+chunk_size = 5
+
+ci = st.session_state.batch_memory["country_index"]
+ti = st.session_state.batch_memory["topic_index"]
+
+if ci < len(countries):
+    country = countries[ci]
+    st.header(f"🌐 Country: {country}")
+    if ti < len(topics):
+        batch_topics = topics[ti:ti + chunk_size]
+        st.subheader(f"📦 Topics {ti + 1} to {ti + len(batch_topics)}")
+        results = []
+        for topic in batch_topics:
+            query = f"{country} {topic} policy"
+            if start_date:
+                query += f" after:{start_date}"
+            if end_date:
+                query += f" before:{end_date}"
+            st.write(f"🔍 Query: {query}")
             try:
-                time.sleep(random.uniform(5, 10))
-                urls = search(query, num_results=5, lang=search_lang, safe="off")
-            except Exception as e:
-                st.warning(f"⚠️ Google search error: {e}")
-                continue
-
-            for i, url in enumerate(urls):
-                if is_url_excluded(url):
-                    st.info(f"🚫 Skipped excluded domain: {url}")
-                    continue
-
-                with st.spinner(f"🔄 Processing {url}..."):
-                    st.write(f"→ {url}")
-                    try:
-                        headers = {"User-Agent": "Mozilla/5.0"}
-                        response = requests.get(url, headers=headers, timeout=10)
-                        content_type = response.headers.get("Content-Type", "")
-
-                        if url.endswith(".pdf") or "application/pdf" in content_type:
-                            content = extract_text_from_pdf(io.BytesIO(response.content))
-                        else:
-                            soup = BeautifulSoup(response.text, "html.parser")
-                            paragraphs = soup.find_all("p")
-                            content = " ".join([p.get_text() for p in paragraphs])
-
-                        if not content or len(content) < 100:
-                            st.warning(f"⛔ Insufficient content from: {url}")
-                            continue
-
+                urls = search(query, num_results=3, lang="en", safe="off")
+                for url in urls:
+                    if is_url_excluded(url):
+                        continue
+                    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                    if "application/pdf" in response.headers.get("Content-Type", ""):
+                        continue
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    content = " ".join([p.get_text() for p in soup.find_all("p")])
+                    if len(content) < 100:
+                        continue
+                    translated = GoogleTranslator(source="auto", target="en").translate(content[:4000])
+                    translated = clean_illegal_chars(translated)
+                    label, confidence = classify_text(translated)
+                    summary = ""
+                    if confidence > 0.3:
                         try:
-                            translated = GoogleTranslator(source="auto", target="en").translate(content[:4000])
-                        except Exception as e:
-                            st.warning(f"⚠️ Translation failed: {e}")
-                            continue
+                            summary = summary_pipe(translated[:512], max_new_tokens=100, min_length=30, do_sample=False)[0]["summary_text"]
+                        except:
+                            pass
+                    results.append({
+                        "Country": country,
+                        "Topic": topic,
+                        "URL": url,
+                        "Label": label,
+                        "Confidence": round(confidence, 2),
+                        "Summary": summary
+                    })
+            except Exception as e:
+                st.warning(f"❌ Error: {e}")
 
-                        translated = clean_illegal_chars(translated)
-                        if country.lower() not in translated.lower():
-                            st.warning(f"⛔ '{country}' not mentioned in document, skipped: {url}")
-                            continue
+        if results:
+            df = pd.DataFrame(results)
+            st.session_state.results.extend(results)
+            st.dataframe(df)
+            output = io.BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            st.download_button(f"📥 Download {country}_batch{ti//chunk_size + 1}", output.getvalue(), file_name=f"results_{country}_batch{ti//chunk_size + 1}.xlsx")
 
-                        if translated.lower().count(country.lower()) < 2:
-                            st.warning(f"⛔ '{country}' mentioned too infrequently, skipped: {url}")
-                            continue
-                        label, confidence = classify_text(translated)
-                        if label == "policy_decision":
-                            st.write("🔁 Refining policy decision type...")
-                            label = refine_policy_decision(translated)
-                        st.write(f"🧪 Label: {label} (confidence={confidence:.2f})")
-                        summary = ""
-                        if confidence > 0.3:
-                            try:
-                                summary = summary_pipe(translated[:1024], max_new_tokens=130, min_length=30, do_sample=False)[0]["summary_text"]
-                            except Exception as e:
-                                st.warning(f"⚠️ Summarization failed: {e}")
+        st.session_state.batch_memory["topic_index"] += chunk_size
+        if st.session_state.batch_memory["topic_index"] >= len(topics):
+            st.session_state.batch_memory["country_index"] += 1
+            st.session_state.batch_memory["topic_index"] = 0
 
-                        all_results.append({
-                            "User": search_owner,
-                            "ID": "",
-                            "Country Name": country,
-                            "Initial date": "",
-                            "End date": "",
-                            "Policy 1": "",
-                            "Policy 2": "",
-                            "Policy direction": "",
-                            "Policy phase": "",
-                            "Policy decision details": "",
-                            "Context or additional info": "",
-                            "Policy decision making institution": "",
-                            "Budget": "",
-                            "Beneficiaries": "",
-                            "Commodity 1": "",
-                            "Commodity 2": "",
-                            "Commodity 3": "",
-                            "Additional Commodities": "",
-                            "Term": "",
-                            "Targeted": "",
-                            "Emergency": "",
-                            "Publish": "",
-                            "Source 1 Name": "",
-                            "Source 1 File": "",
-                            "Source 1 Link": url,
-                            "Publish Source 1": "",
-                            "Source 2 Name": "",
-                            "Source 2 File": "",
-                            "Source 2 Link": "",
-                            "Publish Source 2": "",
-                            "Source 3 Name": "",
-                            "Source 3 File": "",
-                            "Source 3 Link": "",
-                            "Publish Source 3": "",
-                            "Giews Measure": "",
-                            "topic": topic,
-                            "query": query,
-                            "publication_date": "",
-                            "text": translated,
-                            "label": label,
-                            "confidence": round(confidence, 3),
-                            "summary": summary
-                        })
-                    except Exception as e:
-                        st.warning(f"❌ Error processing URL {url}: {e}")
-
-    if all_results:
-        df = pd.DataFrame(all_results)
-        df = drop_near_duplicates(df)
-        output = io.BytesIO()
-        df.to_excel(output, index=False, engine="openpyxl")
-        st.download_button(
-            label="📥 Download Excel",
-            data=output.getvalue(),
-            file_name="fapda_google_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.warning("No valid documents to export.")
+        st.rerun()
+else:
+    st.success("🎉 All countries and topic batches processed.")

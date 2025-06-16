@@ -1,0 +1,13 @@
+transformers
+torch
+pandas
+tqdm
+scikit-learn
+bs4
+openpyxl
+requests
+deep-translator
+streamlit
+googlesearch-python
+PyMuPDF
+poppler-utils
